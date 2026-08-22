@@ -14,6 +14,11 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173"
     environment: str = "development"
 
+    # Gemini via Google AI Studio's free-tier API. Isolated to this one setting + llm_service.py
+    # so a future provider swap (a different key/SDK) touches those two places only.
+    gemini_api_key: str
+    gemini_model: str = "gemini-3.6-flash"
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property

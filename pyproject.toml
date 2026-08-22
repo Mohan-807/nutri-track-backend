@@ -13,6 +13,7 @@ dependencies = [
   "pydantic-settings",
   "passlib[argon2]",
   "pyjwt",
+  "google-genai>=2.19.0",
 ]
 
 [dependency-groups]
