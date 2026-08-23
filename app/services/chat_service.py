@@ -1,6 +1,8 @@
 import logging
 import time
 from collections.abc import Iterator
+from datetime import UTC, date, datetime
+from datetime import time as time_of_day
 
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
@@ -82,6 +84,31 @@ def _reset_rate_limit_state_for_tests() -> None:
     _last_message_at.clear()
 
 
+# Chat history is deliberately short-lived — only the current calendar day's conversation is
+# kept. Unlike everything else in this app (log entries, foods), a chat transcript has no lasting
+# value here once the day it happened is over, and letting it grow forever would also keep
+# inflating HISTORY_LIMIT_FOR_LLM's window with stale, irrelevant turns. Scoped ONLY to
+# chat_messages — log history, food catalog, etc. are untouched and keep their full history.
+def _start_of_today_utc() -> datetime:
+    return datetime.combine(datetime.now(UTC).date(), time_of_day.min, tzinfo=UTC)
+
+
+def _clear_previous_days(db: Session, user_id: int) -> None:
+    cutoff = _start_of_today_utc()
+    # synchronize_session="fetch" (not the cheaper False): this deletes rows that may already be
+    # tracked in the session's identity map (e.g. loaded earlier in the same request/test) —
+    # skipping sync there leaves stale Python objects referencing now-deleted rows, which then
+    # collide with a *new* row that reuses the same id (observed as a real SAWarning in tests).
+    deleted = (
+        db.query(ChatMessage)
+        .filter(ChatMessage.user_id == user_id, ChatMessage.created_at < cutoff)
+        .delete(synchronize_session="fetch")
+    )
+    if deleted:
+        db.commit()
+        logger.info("Cleared %d chat message(s) from a previous day for user %s", deleted, user_id)
+
+
 def _load_recent_messages(db: Session, user_id: int, limit: int) -> list[ChatMessage]:
     messages = (
         db.query(ChatMessage)
@@ -97,7 +124,7 @@ def _build_turns(messages: list[ChatMessage]) -> list[dict]:
     return [{"role": m.role, "text": m.content} for m in messages]
 
 
-def _run_tool(db: Session, current_user: User, name: str, args: dict) -> dict:
+def _run_tool(db: Session, current_user: User, name: str, args: dict, today: date) -> dict:
     """The backend is the authority here, never the LLM: an unrecognized name is rejected by the
     registry itself (get_tool returning None — the allowlist), a tool's own pydantic model
     rejects bad/missing arguments, and any other failure is caught rather than crashing the
@@ -110,7 +137,7 @@ def _run_tool(db: Session, current_user: User, name: str, args: dict) -> dict:
         return {"error": f"Unknown tool '{name}'."}
 
     try:
-        return tool.execute(db, current_user, args)
+        return tool.execute(db, current_user, args, today)
     except ValidationError as exc:
         db.rollback()
         first_error = exc.errors()[0]["msg"] if exc.errors() else str(exc)
@@ -125,7 +152,7 @@ def _run_tool(db: Session, current_user: User, name: str, args: dict) -> dict:
         return {"error": f"{name} failed unexpectedly."}
 
 
-def send_message_stream(db: Session, user_id: int, message: str) -> Iterator[dict]:
+def send_message_stream(db: Session, user_id: int, message: str, client_date: date | None = None) -> Iterator[dict]:
     """Persist the user's turn, then run the LLM in a loop that may call tools before producing
     a final reply — yielding plain-dict events the /chat router turns into SSE:
       {"type": "provider", "provider", "model"}  — which AI is serving this request
@@ -151,8 +178,17 @@ def send_message_stream(db: Session, user_id: int, message: str) -> Iterator[dic
         yield {"type": "error", "message": rate_limit_message}
         return
 
+    # The user's local calendar date, threaded explicitly into every tool call below (see
+    # ToolSpec in tools/base.py) rather than stashed in thread-local/request-scoped state: a
+    # streamed response's generator can genuinely resume on a different threadpool worker thread
+    # between yields, so a value set once at the top would not reliably still be visible several
+    # tool calls later in the same request.
+    today = client_date or datetime.now(UTC).date()
+
     try:
         current_user = db.get(User, user_id)
+
+        _clear_previous_days(db, user_id)
 
         user_turn = ChatMessage(user_id=user_id, role="user", content=message)
         db.add(user_turn)
@@ -188,7 +224,7 @@ def send_message_stream(db: Session, user_id: int, message: str) -> Iterator[dic
             turns.append({"role": "assistant", "tool_call": {k: function_call[k] for k in ("id", "name", "args")}})
             yield {"type": "tool_call", "name": function_call["name"], "args": function_call["args"]}
 
-            result = _run_tool(db, current_user, function_call["name"], function_call["args"])
+            result = _run_tool(db, current_user, function_call["name"], function_call["args"], today)
             yield {"type": "tool_result", "name": function_call["name"], "success": "error" not in result}
             turns.append(
                 {
@@ -229,7 +265,10 @@ def send_message_stream(db: Session, user_id: int, message: str) -> Iterator[dic
 def get_history(db: Session, user_id: int, limit: int = 200) -> list[ChatMessage]:
     """The transcript the frontend loads on mount — a much higher cap than
     HISTORY_LIMIT_FOR_LLM, which only bounds what's sent *to the LLM* per turn, not what the UI
-    is allowed to show."""
+    is allowed to show. Also clears any previous day's leftovers (see _clear_previous_days) so
+    opening the chat tab on a new day shows a clean slate immediately, without waiting for the
+    user to send a first message."""
+    _clear_previous_days(db, user_id)
     return (
         db.query(ChatMessage)
         .filter(ChatMessage.user_id == user_id)

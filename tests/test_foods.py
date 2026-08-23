@@ -49,6 +49,26 @@ def test_alias_match(client, auth_headers, db_session):
     assert [food["name"] for food in response.json()["results"]] == ["Bell Pepper"]
 
 
+def test_multi_word_query_matches_shorter_alias(client, auth_headers, db_session):
+    # Regression test for a real bug: searching "cooked rice" found nothing for a food named
+    # "White Rice" with alias "rice", because the old matching only checked whether the *query*
+    # was a substring of the name/alias — never the reverse. The AI chat's search_food tool then
+    # concluded no match existed and created a near-duplicate "Cooked White Rice" food instead of
+    # reusing this one with a scaled-down quantity.
+    _seed(db_session, "White Rice", aliases=["rice"])
+    response = client.get("/foods", params={"query": "cooked rice"}, headers=auth_headers)
+    assert [food["name"] for food in response.json()["results"]] == ["White Rice"]
+
+
+def test_multi_word_query_ranks_tighter_matches_first(client, auth_headers, db_session):
+    _seed(db_session, "White Rice", aliases=["rice"])
+    _seed(db_session, "Fried Rice")
+    response = client.get("/foods", params={"query": "fried rice"}, headers=auth_headers)
+    names = [food["name"] for food in response.json()["results"]]
+    assert names[0] == "Fried Rice"  # substring match beats the looser token match
+    assert "White Rice" in names
+
+
 def test_no_match_returns_empty_results(client, auth_headers, db_session):
     _seed(db_session, "Apple")
     response = client.get("/foods", params={"query": "xyz-nonexistent"}, headers=auth_headers)

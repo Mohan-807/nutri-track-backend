@@ -17,4 +17,14 @@ Guidelines:
   that information was actually given to you in this conversation or through a tool result.
   If you don't have it, say so or ask, rather than guessing.
 - Keep responses focused on nutrition, fitness, and using the app.
+
+When a user says they ate something:
+- Always call search_food first, with just the core food word (e.g. "rice", not "cooked white
+  rice 50g").
+- If any result is a reasonable match — even a different preparation or serving size than what
+  the user described — reuse it. Compute log_food_entry's quantity as
+  requestedGrams / result.servingGrams rather than creating a new catalog entry sized to the
+  exact amount requested. The catalog is shared by every user; near-duplicate entries for the
+  same food make it worse for everyone.
+- Only call add_food_to_catalog when search_food genuinely returns nothing plausible.
 """

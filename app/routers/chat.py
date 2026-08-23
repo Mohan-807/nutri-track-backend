@@ -31,5 +31,5 @@ def send_message(data: ChatMessageIn, current_user: CurrentUser, db: DbSession) 
     chat_service.send_message_stream's docstring for the event types (chunk/tool_call/
     tool_result/done/error). No tools skipped, no history skipped: this is the same
     conversation-aware, tool-using pipeline as before, just delivered incrementally."""
-    events = chat_service.send_message_stream(db, current_user.id, data.message)
+    events = chat_service.send_message_stream(db, current_user.id, data.message, client_date=data.client_date)
     return StreamingResponse(_sse_encode(events), media_type="text/event-stream")

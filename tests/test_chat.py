@@ -1,5 +1,7 @@
 import json
+from datetime import UTC, datetime, timedelta
 
+from app.models.chat_message import ChatMessage
 from app.services import chat_service
 from app.services.llm_service import AllModelsExhausted, LlmError
 
@@ -248,3 +250,71 @@ def test_chat_history_isolated_per_user(client, monkeypatch):
 def test_chat_rejects_empty_message(client, auth_headers):
     response = client.post("/chat", json={"message": ""}, headers=auth_headers)
     assert response.status_code == 422
+
+
+def test_chat_uses_client_local_date_for_tool_default_dates(client, auth_headers, monkeypatch, sample_food):
+    # Regression test for a real bug found live: log_food_entry defaulted to UTC "today" when the
+    # model omitted a date, which disagreed with a user's actual local day for hours around
+    # midnight (e.g. IST) and silently filed the entry under the wrong date — invisible on the
+    # frontend's Today page, which asks for the browser's local date.
+    calls = {"n": 0}
+
+    def fake_stream_turn(turns, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            args = {"foodId": sample_food.id, "quantity": 1}
+            yield from _call_stream("log_food_entry", args)(turns, **kwargs)
+        else:
+            yield from _text_stream("Logged it.")(turns, **kwargs)
+
+    monkeypatch.setattr(chat_service, "stream_turn", fake_stream_turn)
+
+    future_local_date = "2099-01-01"  # deliberately far from any server "today"
+    response = client.post(
+        "/chat", json={"message": "log it", "clientDate": future_local_date}, headers=auth_headers
+    )
+    assert response.status_code == 200
+
+    day = client.get(f"/logs/{future_local_date}", headers=auth_headers).json()
+    assert len(day["entries"]) == 1
+
+
+def test_chat_clears_previous_days_messages_on_new_send(client, auth_headers, db_session, monkeypatch):
+    monkeypatch.setattr(chat_service, "stream_turn", _text_stream("ok"))
+    user_id = client.get("/auth/me", headers=auth_headers).json()["id"]
+
+    stale = ChatMessage(
+        user_id=user_id, role="user", content="yesterday's message", created_at=datetime.now(UTC) - timedelta(days=1)
+    )
+    db_session.add(stale)
+    db_session.commit()
+
+    client.post("/chat", json={"message": "today's message"}, headers=auth_headers)
+
+    history = client.get("/chat", headers=auth_headers).json()["messages"]
+    assert [m["content"] for m in history] == ["today's message", "ok"]
+
+
+def test_chat_history_endpoint_also_clears_previous_days(client, auth_headers, db_session):
+    # Opening the chat tab on a new day shows a clean slate immediately — the clear doesn't wait
+    # for the user to send a first message.
+    user_id = client.get("/auth/me", headers=auth_headers).json()["id"]
+    stale = ChatMessage(
+        user_id=user_id, role="assistant", content="stale reply", created_at=datetime.now(UTC) - timedelta(days=2)
+    )
+    db_session.add(stale)
+    db_session.commit()
+
+    assert client.get("/chat", headers=auth_headers).json()["messages"] == []
+
+
+def test_chat_keeps_same_day_messages_across_requests(client, auth_headers, monkeypatch):
+    # The clearing is day-scoped, not per-request — messages from earlier today must survive.
+    monkeypatch.setattr(chat_service, "stream_turn", _text_stream("ok"))
+
+    client.post("/chat", json={"message": "first"}, headers=auth_headers)
+    chat_service._reset_rate_limit_state_for_tests()
+    client.post("/chat", json={"message": "second"}, headers=auth_headers)
+
+    history = client.get("/chat", headers=auth_headers).json()["messages"]
+    assert [m["content"] for m in history] == ["first", "ok", "second", "ok"]

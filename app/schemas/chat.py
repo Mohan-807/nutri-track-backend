@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import Field
 
@@ -8,6 +8,11 @@ from app.schemas.common import CamelModel
 
 class ChatMessageIn(CamelModel):
     message: str = Field(min_length=1, max_length=4000)
+    # The sender's local calendar date (frontend's dateUtils.todayKey()) — the backend has no
+    # stored per-user timezone, so without this, a tool defaulting to "today" (log_food_entry,
+    # get_day_totals) would use UTC's date, which disagrees with the user's actual day for hours
+    # around midnight. Optional so older/other clients that omit it just fall back to UTC.
+    client_date: date | None = None
 
 
 class ChatMessageOut(CamelModel):

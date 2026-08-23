@@ -14,11 +14,12 @@ class GetDayTotalsArgs(CamelModel):
     date: date_type | None = None
 
 
-def _execute(db: Session, current_user: User, args: dict) -> dict:
+def _execute(db: Session, current_user: User, args: dict, today: date_type | None = None) -> dict:
     parsed = GetDayTotalsArgs.model_validate(args)
-    # UTC "today" as the fallback when the model doesn't supply a date — same simplification the
-    # rest of this app already lives with (no per-user timezone handling exists anywhere yet).
-    log_date = parsed.date or datetime.now(UTC).date()
+    # `today` (the user's local calendar date, from chat_service) as the fallback — UTC "today"
+    # disagrees with the user's actual calendar day for hours around midnight. None only for
+    # direct calls (unit tests) that don't go through chat_service.
+    log_date = parsed.date or today or datetime.now(UTC).date()
 
     # Scoped to current_user.id, never a user id from the model — same ownership boundary as
     # every REST endpoint (e.g. GET /logs/{date}).

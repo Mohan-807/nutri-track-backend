@@ -1,3 +1,5 @@
+from datetime import date
+
 from pydantic import Field
 from sqlalchemy.orm import Session
 
@@ -29,7 +31,10 @@ class AddFoodToCatalogArgs(FoodCreateIn):
     sodium_mg: float = Field(default=0, ge=0, le=MAX_SODIUM_MG_PER_SERVING)
 
 
-def _execute(db: Session, current_user: User, args: dict) -> dict:
+def _execute(db: Session, current_user: User, args: dict, today: date | None = None) -> dict:
+    # `today` (the user's local date) is part of every tool's uniform call signature (see
+    # ToolSpec in base.py) but unused here — creating a catalog entry has no date-dependent
+    # behavior.
     parsed = AddFoodToCatalogArgs.model_validate(args)
     # Tagged distinctly from manually-entered foods (category="custom") — this is a model's
     # guess at nutrition facts, not something the eater looked up or measured, and it's about to
@@ -42,10 +47,13 @@ ADD_FOOD_TO_CATALOG = ToolSpec(
     name="add_food_to_catalog",
     description=(
         "Add a new food to the catalog. Only call this after search_food has already been "
-        "called and returned no good match — never skip straight to this. Estimate typical "
-        "nutrition values for one reasonable serving using your own knowledge; the backend "
-        "validates the numbers are plausible before saving them, and the food becomes "
-        "immediately available to log via log_food_entry."
+        "called AND returned nothing that reasonably matches what the user is eating — a "
+        "different serving size or a different preparation of a food that IS in the results "
+        "(e.g. the user said 'cooked rice' and a result named 'White Rice' or similar came "
+        "back) is NOT a reason to add a new entry; scale that result's quantity instead. "
+        "Estimate typical nutrition values for one reasonable serving using your own "
+        "knowledge; the backend validates the numbers are plausible before saving them, and "
+        "the food becomes immediately available to log via log_food_entry."
     ),
     parameters={
         "type": "object",
