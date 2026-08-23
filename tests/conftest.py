@@ -7,10 +7,20 @@ from sqlalchemy.pool import StaticPool
 from app.database import Base, enable_sqlite_foreign_keys, get_db
 from app.main import app
 from app.models.food import Food
+from app.services.chat_service import _reset_rate_limit_state_for_tests
 
 # Tests never run Alembic and never touch Postgres — schema comes from Base.metadata.create_all()
 # against a throwaway in-memory SQLite DB, always in sync with the current model code. The real
 # dev/prod database is provisioned exclusively via `alembic upgrade head` against Postgres.
+
+
+@pytest.fixture(autouse=True)
+def _reset_chat_rate_limit():
+    # chat_service's rate limiter is in-memory and keyed by user id; each test gets a fresh
+    # database where ids restart at 1, so without this, one test's timing could spuriously
+    # rate-limit an unrelated later test reusing the same id.
+    _reset_rate_limit_state_for_tests()
+    yield
 
 
 @pytest.fixture()

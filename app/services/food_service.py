@@ -29,12 +29,15 @@ def rank_foods(foods: list[Food], query: str | None) -> list[Food]:
     return [food for _, food in scored]
 
 
-def create_food(db: Session, data: FoodCreateIn, *, created_by_user_id: int) -> Food:
-    """Mirrors foodCatalogStore.addFood's defaults: category="custom", aliases=[]."""
+def create_food(db: Session, data: FoodCreateIn, *, created_by_user_id: int, category: str = "custom") -> Food:
+    """Mirrors foodCatalogStore.addFood's defaults: category="custom", aliases=[]. The chat
+    AI's add_food_to_catalog tool overrides `category` to "ai_estimated" — the manual Add Food
+    dialog's values were entered by the person eating the food; the AI's are a guess from its
+    own knowledge, and the two shouldn't be indistinguishable in a catalog every user searches."""
     food = Food(
         name=data.name.strip(),
         aliases=[],
-        category="custom",
+        category=category,
         serving_label=data.serving_label.strip(),
         serving_grams=data.serving_grams,
         calories=data.calories,

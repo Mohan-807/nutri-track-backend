@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     # so a future provider swap (a different key/SDK) touches those two places only.
     gemini_api_key: str
     gemini_model: str = "gemini-3.6-flash"
+    gemini_timeout_seconds: float = 30.0
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

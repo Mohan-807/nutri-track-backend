@@ -20,3 +20,6 @@ class User(Base):
     log_entries: Mapped[list["LogEntry"]] = relationship(  # noqa: F821
         back_populates="user", cascade="all, delete-orphan"
     )
+    chat_messages: Mapped[list["ChatMessage"]] = relationship(  # noqa: F821
+        back_populates="user", cascade="all, delete-orphan"
+    )
