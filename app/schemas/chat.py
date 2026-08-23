@@ -19,6 +19,10 @@ class ChatHistoryMessageOut(CamelModel):
     role: str
     content: str
     created_at: datetime
+    # Only populated on assistant messages (and null on rows written before multi-provider
+    # support), so the UI can show which model produced a given reply.
+    provider: str | None = None
+    model: str | None = None
 
 
 class ChatHistoryOut(CamelModel):
@@ -31,4 +35,6 @@ def chat_message_to_out(message: ChatMessage) -> ChatHistoryMessageOut:
         role=message.role,
         content=message.content,
         created_at=message.created_at,
+        provider=message.provider,
+        model=message.model,
     )

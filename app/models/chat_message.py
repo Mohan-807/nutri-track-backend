@@ -20,6 +20,15 @@ class ChatMessage(Base):
     )
     role: Mapped[str] = mapped_column(String(20), nullable=False)  # "user" | "assistant"
     content: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # Which AI actually produced this reply. Nullable because they're only meaningful on
+    # role="assistant" rows (a user's own message has no model), and because rows written before
+    # multi-provider support existed have no value to backfill with. Recorded per message rather
+    # than as one global "current model" setting: with automatic failover the answer differs from
+    # message to message, so a single mutable row would be wrong the moment a switch happened —
+    # and it could never explain which model produced a reply you're looking at in history.
+    provider: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(120), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

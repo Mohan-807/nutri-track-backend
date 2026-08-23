@@ -1,7 +1,7 @@
 import json
 
 from app.services import chat_service
-from app.services.llm_service import LlmError
+from app.services.llm_service import AllModelsExhausted, LlmError
 
 
 def _parse_sse(text: str) -> list[dict]:
@@ -13,18 +13,22 @@ def _parse_sse(text: str) -> list[dict]:
     return events
 
 
+TEST_PROVIDER = {"type": "provider", "provider": "gemini", "model": "test-model"}
+
+
 def _text_stream(text):
-    def fake(contents, **kwargs):
+    def fake(turns, **kwargs):
+        yield dict(TEST_PROVIDER)
         yield {"type": "chunk", "text": text}
-        yield {"type": "done", "content": {"role": "model", "parts": [{"text": text}]}, "text": text}
+        yield {"type": "done", "text": text}
 
     return fake
 
 
-def _call_stream(name, args):
-    def fake(contents, **kwargs):
-        content = {"role": "model", "parts": [{"function_call": {"name": name, "args": args}}]}
-        yield {"type": "function_call", "name": name, "args": args, "content": content}
+def _call_stream(name, args, call_id="call_1"):
+    def fake(turns, **kwargs):
+        yield dict(TEST_PROVIDER)
+        yield {"type": "function_call", "id": call_id, "name": name, "args": args}
 
     return fake
 
@@ -50,7 +54,7 @@ def test_chat_streams_llm_reply_and_persists_history(client, auth_headers, monke
 
     events = _parse_sse(response.text)
     assert {"type": "chunk", "text": "echo:hello"} in events
-    assert events[-1] == {"type": "done", "reply": "echo:hello"}
+    assert events[-1] == {"type": "done", "reply": "echo:hello", "provider": "gemini", "model": "test-model"}
 
     history = client.get("/chat", headers=auth_headers).json()["messages"]
     assert [m["role"] for m in history] == ["user", "assistant"]
@@ -58,12 +62,42 @@ def test_chat_streams_llm_reply_and_persists_history(client, auth_headers, monke
     assert history[1]["content"] == "echo:hello"
 
 
-def test_chat_sends_prior_turns_as_context(client, auth_headers, monkeypatch):
-    seen_contents = []
+def test_chat_records_provider_and_model_on_assistant_row(client, auth_headers, monkeypatch):
+    monkeypatch.setattr(chat_service, "stream_turn", _text_stream("hello"))
+    client.post("/chat", json={"message": "hi"}, headers=auth_headers)
 
-    def fake_stream_turn(contents, **kwargs):
-        seen_contents.append(list(contents))
-        yield {"type": "done", "content": {"role": "model", "parts": [{"text": "ok"}]}, "text": "ok"}
+    history = client.get("/chat", headers=auth_headers).json()["messages"]
+    user_msg, assistant_msg = history
+
+    # Which model answered is recorded on the assistant row and exposed to the UI...
+    assert assistant_msg["provider"] == "gemini"
+    assert assistant_msg["model"] == "test-model"
+    # ...and left null on the user's own message, which no model produced.
+    assert user_msg["provider"] is None
+    assert user_msg["model"] is None
+
+
+def test_chat_reports_all_models_exhausted(client, auth_headers, monkeypatch):
+    def fake_stream_turn(turns, **kwargs):
+        for _ in ():
+            yield
+        raise AllModelsExhausted()
+
+    monkeypatch.setattr(chat_service, "stream_turn", fake_stream_turn)
+
+    response = client.post("/chat", json={"message": "hi"}, headers=auth_headers)
+    events = _parse_sse(response.text)
+    assert events[-1]["type"] == "error"
+    assert "All AI models are currently unavailable" in events[-1]["message"]
+
+
+def test_chat_sends_prior_turns_as_context(client, auth_headers, monkeypatch):
+    seen_turns = []
+
+    def fake_stream_turn(turns, **kwargs):
+        seen_turns.append(list(turns))
+        yield dict(TEST_PROVIDER)
+        yield {"type": "done", "text": "ok"}
 
     monkeypatch.setattr(chat_service, "stream_turn", fake_stream_turn)
 
@@ -74,29 +108,29 @@ def test_chat_sends_prior_turns_as_context(client, auth_headers, monkeypatch):
     chat_service._reset_rate_limit_state_for_tests()
     client.post("/chat", json={"message": "second"}, headers=auth_headers)
 
-    # The second call's contents include the first turn's exchange, mapped to Gemini's role
-    # vocabulary ("assistant" -> "model") — proof the LLM actually gets conversation memory.
-    assert seen_contents[1] == [
-        {"role": "user", "parts": [{"text": "first"}]},
-        {"role": "model", "parts": [{"text": "ok"}]},
-        {"role": "user", "parts": [{"text": "second"}]},
+    # The second call's turns include the first exchange, in the provider-neutral format each
+    # provider translates for itself — proof the LLM actually gets conversation memory.
+    assert seen_turns[1] == [
+        {"role": "user", "text": "first"},
+        {"role": "assistant", "text": "ok"},
+        {"role": "user", "text": "second"},
     ]
 
 
 def test_chat_executes_real_tool_and_feeds_result_back(client, auth_headers, monkeypatch, sample_food):
     calls = {"n": 0}
 
-    def fake_stream_turn(contents, **kwargs):
+    def fake_stream_turn(turns, **kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
-            yield from _call_stream("search_food", {"query": sample_food.name})(contents, **kwargs)
+            yield from _call_stream("search_food", {"query": sample_food.name})(turns, **kwargs)
         else:
             # The function_response turn chat_service appended should carry the real search_food
             # tool's real database result — not a stub — proving the registry actually
             # dispatched to the tool and executed it.
-            response = contents[-1]["parts"][0]["function_response"]["response"]
+            response = turns[-1]["result"]
             assert response["results"][0]["name"] == sample_food.name
-            yield from _text_stream(f"You have {sample_food.name} in the catalog.")(contents, **kwargs)
+            yield from _text_stream(f"You have {sample_food.name} in the catalog.")(turns, **kwargs)
 
     monkeypatch.setattr(chat_service, "stream_turn", fake_stream_turn)
 
@@ -105,21 +139,22 @@ def test_chat_executes_real_tool_and_feeds_result_back(client, auth_headers, mon
 
     assert {"type": "tool_call", "name": "search_food", "args": {"query": sample_food.name}} in events
     assert any(e["type"] == "tool_result" and e["name"] == "search_food" and e["success"] for e in events)
-    assert events[-1] == {"type": "done", "reply": f"You have {sample_food.name} in the catalog."}
+    assert events[-1]["type"] == "done"
+    assert events[-1]["reply"] == f"You have {sample_food.name} in the catalog."
     assert calls["n"] == 2
 
 
 def test_chat_rejects_unrecognized_tool_gracefully(client, auth_headers, monkeypatch):
     calls = {"n": 0}
 
-    def fake_stream_turn(contents, **kwargs):
+    def fake_stream_turn(turns, **kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
-            yield from _call_stream("delete_all_users", {})(contents, **kwargs)
+            yield from _call_stream("delete_all_users", {})(turns, **kwargs)
         else:
-            error = contents[-1]["parts"][0]["function_response"]["response"]["error"]
+            error = turns[-1]["result"]["error"]
             assert "Unknown tool" in error
-            yield from _text_stream("I can't do that.")(contents, **kwargs)
+            yield from _text_stream("I can't do that.")(turns, **kwargs)
 
     monkeypatch.setattr(chat_service, "stream_turn", fake_stream_turn)
 
@@ -129,7 +164,8 @@ def test_chat_rejects_unrecognized_tool_gracefully(client, auth_headers, monkeyp
     assert any(
         e["type"] == "tool_result" and e["name"] == "delete_all_users" and not e["success"] for e in events
     )
-    assert events[-1] == {"type": "done", "reply": "I can't do that."}
+    assert events[-1]["type"] == "done"
+    assert events[-1]["reply"] == "I can't do that."
 
 
 def test_chat_stops_after_max_tool_rounds(client, auth_headers, monkeypatch):
@@ -144,7 +180,7 @@ def test_chat_stops_after_max_tool_rounds(client, auth_headers, monkeypatch):
 
 
 def test_chat_emits_error_event_on_llm_failure(client, auth_headers, monkeypatch):
-    def fake_stream_turn(contents, **kwargs):
+    def fake_stream_turn(turns, **kwargs):
         for _ in ():
             yield  # never runs — makes this a generator function that raises on first iteration
         raise RuntimeError("boom")
@@ -161,7 +197,7 @@ def test_chat_surfaces_llm_error_message_directly(client, auth_headers, monkeypa
     # A rate limit (or any classified LlmError from llm_service) should reach the client with
     # its own specific, accurate message — not get overwritten by the generic fallback used for
     # truly unexpected failures.
-    def fake_stream_turn(contents, **kwargs):
+    def fake_stream_turn(turns, **kwargs):
         for _ in ():
             yield
         raise LlmError("The AI is rate-limited right now (free-tier quota). Please wait a bit and try again.", retryable=True)
@@ -182,7 +218,7 @@ def test_chat_rate_limits_rapid_messages(client, auth_headers, monkeypatch):
     first = client.post("/chat", json={"message": "one"}, headers=auth_headers)
     second = client.post("/chat", json={"message": "two"}, headers=auth_headers)
 
-    assert _parse_sse(first.text)[-1] == {"type": "done", "reply": "ok"}
+    assert _parse_sse(first.text)[-1]["reply"] == "ok"
     second_events = _parse_sse(second.text)
     assert second_events[-1]["type"] == "error"
     assert "too quickly" in second_events[-1]["message"]

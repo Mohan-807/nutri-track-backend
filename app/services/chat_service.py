@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from app.models.chat_message import ChatMessage
 from app.models.user import User
 from app.services.chat_prompts import SYSTEM_INSTRUCTION
-from app.services.llm_service import LlmError, function_response_turn, stream_turn
+from app.services.llm_service import LlmError, stream_turn
 from app.services.tools import TOOL_DECLARATIONS, get_tool
 
 logger = logging.getLogger(__name__)
@@ -49,8 +49,9 @@ HISTORY_LIMIT_FOR_LLM = 20
 # request. This is a backend-enforced limit; the LLM has no say in it.
 MAX_TOOL_ROUNDS = 5
 
-# ChatMessage.role -> Gemini's own role vocabulary.
-_GEMINI_ROLE = {"user": "user", "assistant": "model"}
+# Persisted rows already use the neutral vocabulary ("user"/"assistant"), so replaying history
+# needs no role mapping — each provider translates to its own wire format (see
+# llm_providers/base.py for the neutral turn shape).
 
 # Rate limiting (Step 11) — a real constraint discovered live while building this: the free-tier
 # Gemini key this app uses is capped at a small number of requests *per day*, and one user
@@ -92,8 +93,8 @@ def _load_recent_messages(db: Session, user_id: int, limit: int) -> list[ChatMes
     return list(reversed(messages))  # newest-first from the query, back to chronological order
 
 
-def _build_contents(messages: list[ChatMessage]) -> list[dict]:
-    return [{"role": _GEMINI_ROLE[m.role], "parts": [{"text": m.content}]} for m in messages]
+def _build_turns(messages: list[ChatMessage]) -> list[dict]:
+    return [{"role": m.role, "text": m.content} for m in messages]
 
 
 def _run_tool(db: Session, current_user: User, name: str, args: dict) -> dict:
@@ -127,14 +128,15 @@ def _run_tool(db: Session, current_user: User, name: str, args: dict) -> dict:
 def send_message_stream(db: Session, user_id: int, message: str) -> Iterator[dict]:
     """Persist the user's turn, then run the LLM in a loop that may call tools before producing
     a final reply — yielding plain-dict events the /chat router turns into SSE:
+      {"type": "provider", "provider", "model"}  — which AI is serving this request
       {"type": "chunk", "text"}            — a piece of the final answer's text
       {"type": "tool_call", "name", "args"}
       {"type": "tool_result", "name", "success"}
-      {"type": "done", "reply"}            — always the last event on success
+      {"type": "done", "reply", "provider", "model"}  — always the last event on success
       {"type": "error", "message"}         — replaces "done" if something failed
     Only the user's message and the model's final text are persisted to ChatMessage —
     intermediate tool calls/results are ephemeral, rebuilt fresh each request, not stored as
-    their own rows.
+    their own rows. The provider/model that produced the reply IS persisted on that row.
 
     Every failure mode below — LLM API failure, rate limit, timeout, streaming interruption
     (a connection drop after some chunks already arrived), or a database error persisting a
@@ -157,13 +159,21 @@ def send_message_stream(db: Session, user_id: int, message: str) -> Iterator[dic
         db.commit()
 
         recent = _load_recent_messages(db, user_id, HISTORY_LIMIT_FOR_LLM)
-        contents = _build_contents(recent)
+        turns = _build_turns(recent)
 
         reply = None
+        provider = None
+        model = None
         for _ in range(MAX_TOOL_ROUNDS):
             function_call = None
-            for event in stream_turn(contents, system_instruction=SYSTEM_INSTRUCTION, tools=TOOL_DECLARATIONS):
-                if event["type"] == "chunk":
+            for event in stream_turn(turns, system_instruction=SYSTEM_INSTRUCTION, tools=TOOL_DECLARATIONS):
+                if event["type"] == "provider":
+                    # Tracked per round: a failover between tool rounds means a later round can be
+                    # served by a different model than the first, and the row should record whoever
+                    # produced the final answer.
+                    provider, model = event["provider"], event["model"]
+                    yield event
+                elif event["type"] == "chunk":
                     yield {"type": "chunk", "text": event["text"]}
                 elif event["type"] == "function_call":
                     function_call = event
@@ -173,17 +183,28 @@ def send_message_stream(db: Session, user_id: int, message: str) -> Iterator[dic
             if function_call is None:
                 break  # the round ended in a final text reply — stop looping
 
-            contents.append(function_call["content"])  # the model's own function-call turn
+            # Recorded as a neutral turn (not a provider SDK object) so a failover on the *next*
+            # round can replay this same tool exchange to a different provider.
+            turns.append({"role": "assistant", "tool_call": {k: function_call[k] for k in ("id", "name", "args")}})
             yield {"type": "tool_call", "name": function_call["name"], "args": function_call["args"]}
 
             result = _run_tool(db, current_user, function_call["name"], function_call["args"])
             yield {"type": "tool_result", "name": function_call["name"], "success": "error" not in result}
-            contents.append(function_response_turn(function_call["name"], result))
+            turns.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": function_call["id"],
+                    "name": function_call["name"],
+                    "result": result,
+                }
+            )
 
         if reply is None:
             reply = "Sorry, that took too many steps to finish — please try rephrasing your request."
 
-        assistant_turn = ChatMessage(user_id=user_id, role="assistant", content=reply)
+        assistant_turn = ChatMessage(
+            user_id=user_id, role="assistant", content=reply, provider=provider, model=model
+        )
         db.add(assistant_turn)
         db.commit()
     except LlmError as exc:
@@ -202,7 +223,7 @@ def send_message_stream(db: Session, user_id: int, message: str) -> Iterator[dic
         yield {"type": "error", "message": "Sorry, something went wrong. Please try again."}
         return
 
-    yield {"type": "done", "reply": reply}
+    yield {"type": "done", "reply": reply, "provider": provider, "model": model}
 
 
 def get_history(db: Session, user_id: int, limit: int = 200) -> list[ChatMessage]:
